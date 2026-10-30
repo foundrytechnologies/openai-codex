@@ -194,6 +194,9 @@ pub struct ModelProviderInfo {
     /// Whether this provider supports the standalone web-search endpoint.
     #[serde(default)]
     pub supports_standalone_web_search: bool,
+    /// Expose MCP tools as top-level functions for compatible providers.
+    #[serde(default)]
+    pub experimental_flat_mcp_tools: bool,
     /// Runtime-only opt-in for internal metadata, independent of the destination check.
     /// This cannot be loaded from or written to serialized provider configuration.
     #[serde(skip)]
@@ -554,6 +557,7 @@ other non-default provider fields are not supported"
             requires_openai_auth: true,
             supports_websockets: true,
             supports_standalone_web_search: true,
+            experimental_flat_mcp_tools: false,
             include_internal_metadata: true,
         }
     }
@@ -593,6 +597,7 @@ other non-default provider fields are not supported"
             requires_openai_auth: false,
             supports_websockets: false,
             supports_standalone_web_search: false,
+            experimental_flat_mcp_tools: false,
             include_internal_metadata: false,
         }
     }
@@ -766,6 +771,7 @@ pub fn create_oss_provider_with_base_url(base_url: &str, wire_api: WireApi) -> M
         requires_openai_auth: false,
         supports_websockets: false,
         supports_standalone_web_search: false,
+        experimental_flat_mcp_tools: false,
         include_internal_metadata: false,
     }
 }

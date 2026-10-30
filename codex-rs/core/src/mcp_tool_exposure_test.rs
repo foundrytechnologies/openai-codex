@@ -103,6 +103,7 @@ fn runtimes_by_name_with_catalog(
         apps_enabled,
         mcp_server_catalog,
         search_tool_enabled,
+        /*flat*/ false,
         &mut handlers,
         &mut registry,
     );
@@ -253,6 +254,7 @@ async fn cached_app_handlers_still_obey_current_apps_enablement_and_tool_policy(
         /*apps_enabled*/ true,
         &catalog,
         /*search_tool_enabled*/ false,
+        /*flat*/ false,
         &mut handlers,
         &mut allowed_registry,
     );
@@ -269,6 +271,7 @@ async fn cached_app_handlers_still_obey_current_apps_enablement_and_tool_policy(
         /*apps_enabled*/ false,
         &catalog,
         /*search_tool_enabled*/ false,
+        /*flat*/ false,
         &mut handlers,
         &mut disabled_registry,
     );
@@ -279,6 +282,7 @@ async fn cached_app_handlers_still_obey_current_apps_enablement_and_tool_policy(
         /*apps_enabled*/ true,
         &catalog,
         /*search_tool_enabled*/ false,
+        /*flat*/ false,
         &mut handlers,
         &mut restricted_registry,
     );
@@ -289,6 +293,7 @@ async fn cached_app_handlers_still_obey_current_apps_enablement_and_tool_policy(
         /*apps_enabled*/ true,
         &catalog,
         /*search_tool_enabled*/ true,
+        /*flat*/ false,
         &mut handlers,
         &mut restored_registry,
     );
@@ -433,6 +438,7 @@ async fn app_tool_registration_uses_trusted_catalog_metadata_and_preserves_sourc
         /*apps_enabled*/ true,
         &ResolvedMcpCatalog::default(),
         /*search_tool_enabled*/ false,
+        /*flat*/ false,
         &mut handlers,
         &mut registry,
     );
@@ -546,5 +552,64 @@ async fn defers_apps_and_non_app_mcp_tools() {
     assert_eq!(
         runtimes,
         expected_runtimes(&mcp_tools, ToolExposure::Deferred)
+    );
+}
+
+#[tokio::test]
+async fn flat_alias_collision_is_recorded() {
+    let config = test_config().await;
+    let tools = [
+        make_mcp_tool("a", "b__c", "mcp__a", "b__c", None, None),
+        make_mcp_tool("a__b", "c", "mcp__a__b", "c", None, None),
+    ];
+    let mut registry = ToolRegistry::default();
+    append_mcp_tools(
+        &tools,
+        &config,
+        false,
+        &ResolvedMcpCatalog::default(),
+        false,
+        true,
+        &mut HashMap::new(),
+        &mut registry,
+    );
+    assert_eq!(
+        registry.first_collision(),
+        Some(&ToolName::plain("mcp__a__b__c").with_default_namespace())
+    );
+}
+
+#[tokio::test]
+async fn flattened_tools_retain_distinct_server_namespaces() {
+    let config = test_config().await;
+    let tools = [
+        make_mcp_tool("first", "read", "mcp__first", "read", None, None),
+        make_mcp_tool("second", "read", "mcp__second", "read", None, None),
+    ];
+    let mut registry = ToolRegistry::default();
+    append_mcp_tools(
+        &tools,
+        &config,
+        false,
+        &ResolvedMcpCatalog::default(),
+        false,
+        true,
+        &mut HashMap::new(),
+        &mut registry,
+    );
+    assert_eq!(
+        registry.mcp_namespaces().collect::<Vec<_>>(),
+        vec![("first", "mcp__first"), ("second", "mcp__second")]
+    );
+    let prefixes = codex_protocol::openai_models::IndirectDescriptionPrefixes {
+        mcp_servers: Some(std::collections::BTreeMap::from([
+            ("first".to_string(), "first guidance".to_string()),
+            ("second".to_string(), "second guidance".to_string()),
+        ])),
+        ..Default::default()
+    };
+    assert!(
+        codex_tools::IndirectNamespacePrefixes::new(Some(&prefixes), registry.mcp_namespaces())
+            .is_ok()
     );
 }

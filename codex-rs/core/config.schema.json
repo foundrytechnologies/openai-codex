@@ -2675,6 +2675,11 @@
           "description": "Value to use with `Authorization: Bearer <token>` header. Use of this config is discouraged in favor of `env_key` for security reasons, but this may be necessary when using this programmatically.",
           "type": "string"
         },
+        "experimental_flat_mcp_tools": {
+          "default": false,
+          "description": "Expose MCP tools as top-level functions for compatible providers.",
+          "type": "boolean"
+        },
         "gateway_oauth": {
           "allOf": [
             {

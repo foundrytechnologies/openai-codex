@@ -13,7 +13,6 @@ use crate::memory_usage::shell_script_for_invocation;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::tools::context::FunctionToolOutput;
-use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolCallState;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
@@ -55,6 +54,10 @@ pub use codex_tools::ToolExposure;
 /// Implementers provide the shared `ToolExecutor` behavior plus optional
 /// core-owned metadata for hooks, telemetry, tool search, and argument diffs.
 pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
+    fn policy_tool_name(&self) -> ToolName {
+        self.tool_name()
+    }
+
     /// Whether this built-in control tool needs a structured tool-call event.
     fn is_builtin_control_tool(&self) -> bool {
         false
@@ -75,6 +78,11 @@ pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
 
     /// Returns a readiness wait for this exact tool before taking the execution gate.
     fn wait_until_ready<'a>(&'a self, _session: &'a Arc<Session>) -> Option<BoxFuture<'a, ()>> {
+        None
+    }
+
+    /// Returns the canonical MCP namespace when the exposed name is an alias.
+    fn mcp_policy_namespace(&self) -> Option<&str> {
         None
     }
 
@@ -381,8 +389,21 @@ impl ToolRegistry {
         runtime: Arc<dyn CoreToolRuntime>,
         exposure: ToolExposure,
     ) -> bool {
+        let policy_name = runtime.tool_name();
+        self.register_external_with_policy_name(runtime, exposure, &policy_name)
+    }
+
+    pub(crate) fn register_external_with_policy_name(
+        &mut self,
+        runtime: Arc<dyn CoreToolRuntime>,
+        exposure: ToolExposure,
+        policy_name: &ToolName,
+    ) -> bool {
         let tool_name = runtime.tool_name().with_default_namespace();
-        if !self.tool_policy.allows(&tool_name) {
+        if !self
+            .tool_policy
+            .allows(&policy_name.clone().with_default_namespace())
+        {
             return false;
         }
         if tool_name.is_default_namespace()
@@ -437,7 +458,12 @@ impl ToolRegistry {
     /// Returns configured MCP server names and their registered callable namespaces.
     pub(crate) fn mcp_namespaces(&self) -> impl Iterator<Item = (&str, &str)> {
         self.tools.iter().filter_map(|(name, tool)| {
-            Some((tool.runtime.mcp_server_name()?, name.namespace.as_deref()?))
+            Some((
+                tool.runtime.mcp_server_name()?,
+                tool.runtime
+                    .mcp_policy_namespace()
+                    .or(name.namespace.as_deref())?,
+            ))
         })
     }
 

@@ -276,7 +276,7 @@ impl ModelProvider for AmazonBedrockModelProvider {
 
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
-            namespace_tools: true,
+            namespace_tools: !self.info.experimental_flat_mcp_tools,
             image_generation: false,
             web_search: self.endpoint == BedrockEndpoint::Mantle,
             external_web_access: false,

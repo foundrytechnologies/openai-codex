@@ -155,7 +155,10 @@ pub trait ModelProvider: fmt::Debug + Send + Sync {
 
     /// Returns the provider-owned capability upper bounds.
     fn capabilities(&self) -> ProviderCapabilities {
-        ProviderCapabilities::default()
+        ProviderCapabilities {
+            namespace_tools: !self.info().experimental_flat_mcp_tools,
+            ..ProviderCapabilities::default()
+        }
     }
 
     /// Returns the preferred model used for automatic approval review.
@@ -468,6 +471,7 @@ impl ModelProvider for ConfiguredModelProvider {
         };
 
         ProviderCapabilities {
+            namespace_tools: !self.info.experimental_flat_mcp_tools,
             remote_compaction,
             ..ProviderCapabilities::default()
         }
@@ -698,6 +702,7 @@ mod tests {
             requires_openai_auth: false,
             supports_websockets: false,
             supports_standalone_web_search: false,
+            experimental_flat_mcp_tools: false,
             include_internal_metadata: false,
         }
     }
@@ -765,6 +770,22 @@ mod tests {
                 remote_compaction: RemoteCompactionSupport::V2,
                 ..ProviderCapabilities::default()
             }
+        );
+    }
+
+    #[test]
+    fn flat_mcp_provider_disables_namespace_capability() {
+        let mut info = ModelProviderInfo::create_openai_provider(None);
+        assert!(
+            create_model_provider(info.clone(), None)
+                .capabilities()
+                .namespace_tools
+        );
+        info.experimental_flat_mcp_tools = true;
+        assert!(
+            !create_model_provider(info, None)
+                .capabilities()
+                .namespace_tools
         );
     }
 
