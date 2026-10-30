@@ -615,6 +615,77 @@ async fn mcp_namespace_instructions_are_preserved_without_hiding_tools() -> anyh
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn flat_mcp_tool_is_advertised_and_dispatched() -> anyhow::Result<()> {
+    skip_if_wine_exec!(
+        Ok(()),
+        "requires a Windows test_stdio_server in the Wine-exec environment"
+    );
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let call_id = "flat-mcp-call";
+    let initial_mock = mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_response_created("resp-1"),
+            responses::ev_function_call(
+                call_id,
+                "mcp__flat__image_scenario",
+                r#"{"scenario":"text_only","caption":"flat MCP result"}"#,
+            ),
+            responses::ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let final_mock = mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_assistant_message("msg-1", "done"),
+            responses::ev_completed("resp-2"),
+        ]),
+    )
+    .await;
+    let command = remote_aware_stdio_server_bin()?;
+    let fixture = test_codex()
+        .with_model_info_override("gpt-5.4", |model| model.supports_search_tool = false)
+        .with_config(move |config| {
+            config.model_provider.experimental_flat_mcp_tools = true;
+            insert_mcp_server(
+                config,
+                "flat",
+                stdio_transport(command, /*env*/ None, Vec::new()),
+                TestMcpServerOptions {
+                    environment_id: remote_aware_environment_id(),
+                    ..Default::default()
+                },
+            );
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    wait_for_mcp_server(&fixture.codex, "flat").await?;
+    fixture
+        .codex
+        .start_or_steer_turn(read_only_user_turn(&fixture, "call the flat MCP tool"))
+        .await?;
+    wait_for_event(&fixture.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let body = initial_mock.single_request().body_json();
+    let tools = body["tools"].as_array().expect("tools array");
+    assert!(
+        tools.iter().any(|tool| {
+            tool["type"] == "function" && tool["name"] == "mcp__flat__image_scenario"
+        })
+    );
+    assert!(!tools.iter().any(|tool| tool["name"] == "mcp__flat"));
+    let output = final_mock.single_request().function_call_output(call_id);
+    assert_eq!(output["output"][1]["text"], "flat MCP result");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn text_only_mcp_content_uses_content_items() -> anyhow::Result<()> {
     skip_if_wine_exec!(
         Ok(()),
