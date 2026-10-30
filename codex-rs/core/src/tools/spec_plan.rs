@@ -156,6 +156,7 @@ pub(crate) fn build_tool_router(
         apps_enabled,
         &mcp.config().mcp_server_catalog,
         search_tool_enabled(turn_context, model_info),
+        turn_context.provider.info().experimental_flat_mcp_tools,
         &mut registry,
     );
     apply_mcp_tool_exposure_policy(
@@ -195,6 +196,7 @@ fn apply_mcp_tool_exposure_policy(
     registry: &mut ToolRegistry,
 ) {
     let mut omitted_exposures_by_tool = HashMap::new();
+    let mut canonical_by_exposed = HashMap::new();
     let apps_config = apps_config_from_layer_stack(&turn_context.config.config_layer_stack);
     for tool in mcp.tools() {
         let tool_name = tool.canonical_tool_name();
@@ -204,8 +206,15 @@ fn apply_mcp_tool_exposure_policy(
         let Some(server) = mcp.config().mcp_server_catalog.server(&tool.server_name) else {
             continue;
         };
+        let exposed_name = if turn_context.provider.info().experimental_flat_mcp_tools {
+            crate::tools::handlers::flat_mcp_tool_name(&tool_name)
+        } else {
+            tool_name.clone()
+        };
+        let exposed_name = exposed_name.with_default_namespace();
+        canonical_by_exposed.insert(exposed_name.clone(), tool_name);
         omitted_exposures_by_tool
-            .entry(tool_name)
+            .entry(exposed_name)
             .or_insert_with(|| {
                 let connector_omissions = (tool.server_name == CODEX_APPS_MCP_SERVER_NAME)
                     .then_some(tool.connector_id.as_deref())
@@ -226,20 +235,23 @@ fn apply_mcp_tool_exposure_policy(
     }
 
     for tool in registry.entries_mut() {
-        let tool_name = tool.runtime.tool_name();
+        let tool_name = tool.runtime.tool_name().with_default_namespace();
         let Some(omitted_exposures) = omitted_exposures_by_tool.get(&tool_name) else {
             continue;
         };
-        let tool_name = tool_name.with_default_namespace();
 
         let mut exposures = ToolExposures::ALL.difference(*omitted_exposures);
-        if tool_name.namespace.as_ref().is_some_and(|namespace| {
-            turn_context
-                .config
-                .code_mode
-                .direct_only_tool_namespaces
-                .contains(namespace)
-        }) {
+        if mcp_policy_name(&canonical_by_exposed, &tool_name)
+            .namespace
+            .as_ref()
+            .is_some_and(|namespace| {
+                turn_context
+                    .config
+                    .code_mode
+                    .direct_only_tool_namespaces
+                    .contains(namespace)
+            })
+        {
             exposures = exposures.difference(ToolExposures::DEFERRED | ToolExposures::CODE_MODE);
         }
 
@@ -267,6 +279,13 @@ fn apply_mcp_tool_exposure_policy(
             (true, true, _) => unreachable!("direct and deferred exposure are mutually exclusive"),
         };
     }
+}
+
+fn mcp_policy_name<'a>(
+    canonical: &'a HashMap<ToolName, ToolName>,
+    exposed: &'a ToolName,
+) -> &'a ToolName {
+    canonical.get(exposed).unwrap_or(exposed)
 }
 
 #[cfg(test)]
@@ -357,6 +376,12 @@ pub(crate) fn finalize_tool_router(
     apply_direct_model_only_namespace_overrides(turn_context, &mut registry);
     let tool_mode = effective_tool_mode(turn_context, model_info);
     let code_mode_enabled = matches!(tool_mode, ToolMode::CodeMode | ToolMode::CodeModeOnly);
+    if code_mode_enabled && turn_context.provider.info().experimental_flat_mcp_tools {
+        return Err(CodexErrorDetails::InvalidRequest(
+            "experimental_flat_mcp_tools does not support Code Mode".to_string(),
+        )
+        .into());
+    }
     if code_mode_enabled {
         for tool_name in [
             ToolName::plain(codex_code_mode::PUBLIC_TOOL_NAME),
@@ -418,6 +443,12 @@ pub(crate) fn finalize_tool_router(
         .turn_metadata_includes_tool_info
         && model_info.use_responses_lite;
 
+    if turn_context.provider.info().experimental_flat_mcp_tools
+        && !turn_context.config.tool_registry.error_on_tool_collisions
+        && let Some(tool_name) = registry.first_collision()
+    {
+        return Err(CodexErrorDetails::ToolCollision(tool_name.to_string()).into());
+    }
     if turn_context.config.tool_registry.error_on_tool_collisions {
         if let Some(tool_name) = registry.first_collision() {
             let namespace = tool_name.namespace.as_deref().unwrap_or("functions");
@@ -533,7 +564,7 @@ fn apply_direct_model_only_namespace_overrides(
     for tool in registry.entries_mut() {
         let configured = tool
             .runtime
-            .tool_name()
+            .policy_tool_name()
             .with_default_namespace()
             .namespace
             .as_ref()
@@ -663,6 +694,7 @@ pub(crate) fn tool_suggest_enabled(turn_context: &TurnContext) -> bool {
 
 fn namespace_tools_enabled(turn_context: &TurnContext) -> bool {
     turn_context.provider.capabilities().namespace_tools
+        && !turn_context.provider.info().experimental_flat_mcp_tools
 }
 
 fn multi_agent_v2_enabled(turn_context: &TurnContext) -> bool {

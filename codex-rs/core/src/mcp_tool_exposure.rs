@@ -31,6 +31,7 @@ struct CachedMcpHandler {
     tool_info: McpToolInfo,
     agent_plugin: bool,
     schema_max_bytes: Option<NonZeroUsize>,
+    flat: bool,
     handler: Arc<McpHandler>,
 }
 
@@ -42,6 +43,7 @@ impl McpHandlerCache {
         apps_enabled: bool,
         mcp_server_catalog: &codex_mcp::ResolvedMcpCatalog,
         search_tool_enabled: bool,
+        flat: bool,
         registry: &mut ToolRegistry,
     ) -> HashSet<ToolName> {
         let mut handlers = self
@@ -54,6 +56,7 @@ impl McpHandlerCache {
             apps_enabled,
             mcp_server_catalog,
             search_tool_enabled,
+            flat,
             &mut handlers,
             registry,
         )
@@ -67,6 +70,7 @@ fn append_mcp_tools(
     apps_enabled: bool,
     mcp_server_catalog: &codex_mcp::ResolvedMcpCatalog,
     search_tool_enabled: bool,
+    flat: bool,
     handlers: &mut HashMap<ToolName, CachedMcpHandler>,
     registry: &mut ToolRegistry,
 ) -> HashSet<ToolName> {
@@ -101,11 +105,18 @@ fn append_mcp_tools(
             cached.tool_info == *tool
                 && cached.agent_plugin == agent_plugin
                 && cached.schema_max_bytes == tool_input_schema_max_bytes
+                && cached.flat == flat
         }) {
             Arc::clone(&cached.handler)
         } else {
             handlers.remove(&tool_name);
-            let handler = if agent_plugin {
+            let handler = if flat {
+                McpHandler::new_flat(
+                    tool.clone(),
+                    agent_plugin,
+                    tool_input_schema_max_bytes.map(NonZeroUsize::get),
+                )
+            } else if agent_plugin {
                 McpHandler::new_agent_plugin(tool.clone())
             } else if let Some(budget) = tool_input_schema_max_bytes {
                 McpHandler::new_with_schema_max_bytes(tool.clone(), budget.get())
@@ -126,6 +137,7 @@ fn append_mcp_tools(
                     tool_info: tool.clone(),
                     agent_plugin,
                     schema_max_bytes: tool_input_schema_max_bytes,
+                    flat,
                     handler: Arc::clone(&handler),
                 },
             );
@@ -153,7 +165,9 @@ fn append_mcp_tools(
         } else {
             ToolExposure::Hidden
         };
-        if registry.register_external_with_exposure(handler, tool_exposure) && fits_agent_budget {
+        if registry.register_external_with_policy_name(handler, tool_exposure, &tool_name)
+            && fits_agent_budget
+        {
             registered_tools.insert(tool_name);
         }
     }

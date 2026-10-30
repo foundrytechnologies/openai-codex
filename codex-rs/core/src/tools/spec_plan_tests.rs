@@ -3409,3 +3409,15 @@ async fn hosted_web_search_and_standalone_image_generation_follow_runtime_gates(
     bedrock_with_standalone_web_search.assert_visible_contains(&["web_search"]);
     bedrock_with_standalone_web_search.assert_visible_lacks(&["web"]);
 }
+
+#[test]
+fn flat_mcp_exposure_uses_original_namespace_policy() {
+    let canonical = ToolName::namespaced("mcp__buildkite", "get_build");
+    let exposed = crate::tools::handlers::flat_mcp_tool_name(&canonical).with_default_namespace();
+    let map = std::collections::HashMap::from([(exposed.clone(), canonical.clone())]);
+    assert_eq!(super::mcp_policy_name(&map, &exposed), &canonical);
+    assert_eq!(
+        super::mcp_policy_name(&map, &exposed).namespace.as_deref(),
+        Some("mcp__buildkite")
+    );
+}

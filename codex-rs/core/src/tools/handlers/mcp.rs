@@ -51,6 +51,7 @@ const MAX_MCP_NAMESPACE_DESCRIPTION_BYTES: usize = 512 * 1024;
 pub struct McpHandler {
     tool_info: ToolInfo,
     spec: Arc<ToolSpec>,
+    flat: bool,
     code_mode_tool_definitions: OnceLock<(Option<usize>, Vec<codex_code_mode::ToolDefinition>)>,
 }
 
@@ -58,6 +59,7 @@ impl McpHandler {
     pub fn new(tool_info: ToolInfo) -> Result<Self, serde_json::Error> {
         Self::with_agent_plugin(
             tool_info, /*agent_plugin*/ false, /*schema_max_bytes*/ None,
+            /*flat*/ false,
         )
     }
 
@@ -69,19 +71,30 @@ impl McpHandler {
             tool_info,
             /*agent_plugin*/ false,
             Some(schema_max_bytes),
+            /*flat*/ false,
         )
     }
 
     pub fn new_agent_plugin(tool_info: ToolInfo) -> Result<Self, serde_json::Error> {
         Self::with_agent_plugin(
             tool_info, /*agent_plugin*/ true, /*schema_max_bytes*/ None,
+            /*flat*/ false,
         )
+    }
+
+    pub(crate) fn new_flat(
+        tool_info: ToolInfo,
+        agent_plugin: bool,
+        schema_max_bytes: Option<usize>,
+    ) -> Result<Self, serde_json::Error> {
+        Self::with_agent_plugin(tool_info, agent_plugin, schema_max_bytes, true)
     }
 
     fn with_agent_plugin(
         mut tool_info: ToolInfo,
         agent_plugin: bool,
         schema_max_bytes: Option<usize>,
+        flat: bool,
     ) -> Result<Self, serde_json::Error> {
         if agent_plugin {
             tool_info.namespace_description =
@@ -100,10 +113,12 @@ impl McpHandler {
             &tool_info,
             agent_plugin,
             schema_max_bytes,
+            flat,
         )?);
         Ok(Self {
             tool_info,
             spec,
+            flat,
             code_mode_tool_definitions: OnceLock::new(),
         })
     }
@@ -113,7 +128,9 @@ impl McpHandler {
     }
 
     fn hook_tool_name(&self) -> HookToolName {
-        HookToolName::new(ensure_mcp_prefix(&join_tool_name(&self.tool_name())))
+        HookToolName::new(ensure_mcp_prefix(&join_tool_name(
+            &self.tool_info.canonical_tool_name(),
+        )))
     }
 }
 
@@ -128,6 +145,10 @@ fn join_tool_name(tool_name: &ToolName) -> String {
     }
 }
 
+pub(crate) fn flat_mcp_tool_name(name: &ToolName) -> ToolName {
+    ToolName::plain(ensure_mcp_prefix(&join_tool_name(name)))
+}
+
 fn ensure_mcp_prefix(name: &str) -> String {
     if name.starts_with(LEGACY_MCP_TOOL_NAME_PREFIX) {
         name.to_string()
@@ -138,7 +159,12 @@ fn ensure_mcp_prefix(name: &str) -> String {
 
 impl ToolExecutor<ToolInvocation> for McpHandler {
     fn tool_name(&self) -> ToolName {
-        self.tool_info.canonical_tool_name()
+        let name = self.tool_info.canonical_tool_name();
+        if self.flat {
+            flat_mcp_tool_name(&name)
+        } else {
+            name
+        }
     }
 
     fn spec(&self) -> ToolSpec {
@@ -257,7 +283,11 @@ impl McpHandler {
             &self.tool_info,
             prepared_mcp_call,
             self.hook_tool_name(),
-            tool_name,
+            if self.flat {
+                self.tool_info.canonical_tool_name()
+            } else {
+                tool_name
+            },
             &source,
             payload,
         )
@@ -277,6 +307,14 @@ impl McpHandler {
 }
 
 impl CoreToolRuntime for McpHandler {
+    fn mcp_policy_namespace(&self) -> Option<&str> {
+        Some(&self.tool_info.callable_namespace)
+    }
+
+    fn policy_tool_name(&self) -> ToolName {
+        self.tool_info.canonical_tool_name()
+    }
+
     fn immutable_spec(&self) -> Option<&Arc<ToolSpec>> {
         Some(&self.spec)
     }
@@ -499,13 +537,22 @@ fn create_tool_spec(
     tool_info: &ToolInfo,
     agent_plugin: bool,
     schema_max_bytes: Option<usize>,
+    flat: bool,
 ) -> Result<ToolSpec, serde_json::Error> {
-    let tool_name = tool_info.canonical_tool_name();
+    let canonical = tool_info.canonical_tool_name();
+    let tool_name = if flat {
+        flat_mcp_tool_name(&canonical)
+    } else {
+        canonical
+    };
     let tool = if agent_plugin {
         agent_plugin_mcp_tool_to_responses_api_tool(&tool_name, &tool_info.tool)?
     } else {
         mcp_tool_to_responses_api_tool(&tool_name, &tool_info.tool, schema_max_bytes)?
     };
+    if flat {
+        return Ok(ToolSpec::Function(tool));
+    }
     let description = tool_info
         .namespace_description
         .as_deref()
@@ -605,6 +652,30 @@ mod tests {
     use serde_json::json;
     use std::time::Duration;
     use tokio::sync::Mutex;
+
+    #[test]
+    fn flat_spec_uses_alias_without_changing_mcp_identity() {
+        let info = tool_info("buildkite", "mcp__buildkite", "get_build");
+        let canonical = info.canonical_tool_name();
+        let flat = McpHandler::new_flat(info.clone(), false, None).unwrap();
+        assert_eq!(
+            flat.tool_name(),
+            ToolName::plain("mcp__buildkite__get_build")
+        );
+        assert_eq!(flat.tool_info.canonical_tool_name(), canonical);
+        assert_eq!(flat.tool_info.tool.name, info.tool.name);
+        assert_eq!(
+            flat.hook_tool_name(),
+            McpHandler::new(info.clone()).unwrap().hook_tool_name()
+        );
+        assert!(
+            matches!(flat.spec(), ToolSpec::Function(tool) if tool.name == "mcp__buildkite__get_build")
+        );
+        assert!(matches!(
+            McpHandler::new(info).unwrap().spec(),
+            ToolSpec::Namespace(_)
+        ));
+    }
 
     #[tokio::test]
     async fn mcp_pre_tool_use_payload_uses_prefixed_tool_name_and_raw_args() {
