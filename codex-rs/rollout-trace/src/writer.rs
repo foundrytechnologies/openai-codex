@@ -2,7 +2,10 @@
 
 use std::fs::File;
 use std::fs::OpenOptions;
+use std::io;
 use std::io::BufWriter;
+use std::io::Seek;
+use std::io::SeekFrom;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
@@ -28,6 +31,9 @@ use crate::raw_event::RawTraceEvent;
 use crate::raw_event::RawTraceEventContext;
 use crate::raw_event::RawTraceEventPayload;
 
+const RECORDING_BUDGET: usize = 64 * 1024 * 1024;
+const LIMIT_MARKER: &str = "capture-limited";
+
 /// Local trace bundle writer.
 ///
 /// The writer appends raw events and writes payload files. It does not keep a
@@ -44,6 +50,9 @@ struct TraceWriterInner {
     event_log: BufWriter<File>,
     next_seq: u64,
     next_payload_ordinal: u64,
+    remaining: usize,
+    limited: bool,
+    limit_marker: File,
 }
 
 impl TraceWriter {
@@ -54,6 +63,22 @@ impl TraceWriter {
         rollout_id: String,
         root_thread_id: AgentThreadId,
     ) -> Result<Self> {
+        Self::create_with_budget(
+            bundle_dir,
+            trace_id,
+            rollout_id,
+            root_thread_id,
+            RECORDING_BUDGET,
+        )
+    }
+
+    fn create_with_budget(
+        bundle_dir: impl AsRef<Path>,
+        trace_id: String,
+        rollout_id: String,
+        root_thread_id: AgentThreadId,
+        budget: usize,
+    ) -> Result<Self> {
         let bundle_dir = bundle_dir.as_ref().to_path_buf();
         let payloads_dir = bundle_dir.join(PAYLOADS_DIR_NAME);
         std::fs::create_dir_all(&payloads_dir)
@@ -62,7 +87,13 @@ impl TraceWriter {
         let started_at_unix_ms = unix_time_ms();
         let manifest =
             TraceBundleManifest::new(trace_id, rollout_id, root_thread_id, started_at_unix_ms);
-        write_json_file(&bundle_dir.join(MANIFEST_FILE_NAME), &manifest)?;
+        let mut serialized = BoundedBytes::new(budget.saturating_sub(1));
+        serde_json::to_writer_pretty(&mut serialized, &manifest)?;
+        let remaining = budget - serialized.bytes.len() - 1;
+        std::fs::write(bundle_dir.join(MANIFEST_FILE_NAME), &serialized.bytes)?;
+        let mut limit_marker = File::create(bundle_dir.join(LIMIT_MARKER))?;
+        limit_marker.write_all(b"0")?;
+        limit_marker.flush()?;
 
         let event_log_path = bundle_dir.join(RAW_EVENT_LOG_FILE_NAME);
         let event_log = OpenOptions::new()
@@ -78,6 +109,9 @@ impl TraceWriter {
                 event_log: BufWriter::new(event_log),
                 next_seq: 1,
                 next_payload_ordinal: 1,
+                remaining,
+                limited: false,
+                limit_marker,
             }),
         })
     }
@@ -94,10 +128,19 @@ impl TraceWriter {
         let raw_payload_id = format!("raw_payload:{ordinal}");
         let relative_path = format!("{PAYLOADS_DIR_NAME}/{ordinal}.json");
         let absolute_path = inner.payloads_dir.join(format!("{ordinal}.json"));
-        // Payload files are created before the event that references them. A
-        // replay interrupted after an event is appended should never point at a
-        // payload file that the writer planned but had not written yet.
-        write_json_file(&absolute_path, value)?;
+        if !inner.limited {
+            let mut serialized = BoundedBytes::new(inner.remaining);
+            let result = serde_json::to_writer_pretty(&mut serialized, value);
+            if serialized.exceeded {
+                inner.mark_limited();
+            } else {
+                result?;
+                // Write the payload before its referencing event.
+                std::fs::write(&absolute_path, &serialized.bytes)
+                    .with_context(|| format!("write JSON {}", absolute_path.display()))?;
+                inner.remaining -= serialized.bytes.len();
+            }
+        }
         Ok(RawPayloadRef {
             raw_payload_id,
             kind,
@@ -126,10 +169,20 @@ impl TraceWriter {
             codex_turn_id: context.codex_turn_id,
             payload,
         };
-        inner.next_seq += 1;
-        serde_json::to_writer(&mut inner.event_log, &event)?;
-        inner.event_log.write_all(b"\n")?;
-        inner.event_log.flush()?;
+        if !inner.limited {
+            let mut serialized = BoundedBytes::new(inner.remaining.saturating_sub(1));
+            let result = serde_json::to_writer(&mut serialized, &event);
+            if inner.remaining == 0 || serialized.exceeded {
+                inner.mark_limited();
+            } else {
+                result?;
+                inner.event_log.write_all(&serialized.bytes)?;
+                inner.event_log.write_all(b"\n")?;
+                inner.event_log.flush()?;
+                inner.remaining -= serialized.bytes.len() + 1;
+                inner.next_seq += 1;
+            }
+        }
         Ok(event)
     }
 
@@ -141,10 +194,46 @@ impl TraceWriter {
     }
 }
 
-fn write_json_file(path: &Path, value: &impl Serialize) -> Result<()> {
-    let file = File::create(path).with_context(|| format!("create {}", path.display()))?;
-    serde_json::to_writer_pretty(file, value)
-        .with_context(|| format!("write JSON {}", path.display()))
+impl TraceWriterInner {
+    fn mark_limited(&mut self) {
+        self.limited = true;
+        // The marker's byte is reserved at creation, so recording can stop
+        // without needing additional disk space when the budget is exhausted.
+        let _ = self.limit_marker.seek(SeekFrom::Start(0));
+        let _ = self.limit_marker.write_all(b"1");
+        let _ = self.limit_marker.flush();
+    }
+}
+
+struct BoundedBytes {
+    bytes: Vec<u8>,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl BoundedBytes {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+            exceeded: false,
+        }
+    }
+}
+
+impl Write for BoundedBytes {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
+            self.exceeded = true;
+            return Err(io::Error::other("trace recording budget exhausted"));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 pub(crate) fn unix_time_ms() -> i64 {
@@ -164,6 +253,7 @@ mod tests {
     use crate::model::RolloutStatus;
     use crate::payload::RawPayloadKind;
     use crate::raw_event::RawTraceEventPayload;
+
     use crate::replay_bundle;
     use crate::writer::TraceWriter;
 
@@ -237,6 +327,10 @@ mod tests {
             status: RolloutStatus::Completed,
         })?;
 
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("capture-limited"))?,
+            "0"
+        );
         let rollout = replay_bundle(temp.path())?;
 
         assert_eq!(rollout.status, RolloutStatus::Completed);
@@ -263,3 +357,7 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "writer_budget_tests.rs"]
+mod budget_tests;
