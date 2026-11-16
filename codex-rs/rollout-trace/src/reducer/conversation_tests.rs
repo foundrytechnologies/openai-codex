@@ -1192,7 +1192,12 @@ fn tool_call_links_model_call_and_followup_output_items() -> anyhow::Result<()> 
         RawPayloadKind::InferenceResponse,
         &json!({
             "response_id": "resp-1",
-            "output_items": [{
+            "token_usage": {
+                "input_tokens": 10, "cached_input_tokens": 1,
+                "cache_write_input_tokens": 0, "output_tokens": 5,
+                "reasoning_output_tokens": 2, "total_tokens": 15
+            },
+            "output_items": [{"type": "reasoning", "summary": [], "content": null, "encrypted_content": null}, {
                 "type": "function_call",
                 "name": "exec_command",
                 "arguments": "{\"cmd\":\"cargo test\"}",
@@ -1230,8 +1235,11 @@ fn tool_call_links_model_call_and_followup_output_items() -> anyhow::Result<()> 
     let followup = writer.write_json_payload(
         RawPayloadKind::InferenceRequest,
         &json!({
-            "previous_response_id": "resp-1",
-            "input": [{
+            "input": [
+                message("user", "run tests"),
+                {"type": "reasoning", "summary": [], "content": null, "encrypted_content": null},
+                {"type": "function_call", "name": "exec_command", "arguments": "{\"cmd\":\"cargo test\"}", "call_id": "call-1"},
+                {
                 "type": "function_call_output",
                 "call_id": "call-1",
                 "output": "tests passed"
@@ -1244,6 +1252,26 @@ fn tool_call_links_model_call_and_followup_output_items() -> anyhow::Result<()> 
     let first_inference = &rollout.inference_calls["inference-1"];
     let second_inference = &rollout.inference_calls["inference-2"];
     let tool_call = &rollout.tool_calls["tool-1"];
+    let reasoning = &rollout.conversation_items[&first_inference.response_item_ids[0]];
+    assert_eq!(reasoning.kind, ConversationItemKind::Reasoning);
+    assert_eq!(reasoning.body.parts, vec![]);
+    assert_eq!(
+        reasoning.produced_by,
+        vec![ProducerRef::Inference {
+            inference_call_id: "inference-1".into()
+        }]
+    );
+    assert_eq!(
+        &second_inference.request_item_ids[1..3],
+        first_inference.response_item_ids
+    );
+    assert_eq!(
+        first_inference
+            .usage
+            .as_ref()
+            .map(|usage| usage.input_tokens),
+        Some(10)
+    );
     let output_item_id = second_inference
         .request_item_ids
         .last()
@@ -1255,7 +1283,7 @@ fn tool_call_links_model_call_and_followup_output_items() -> anyhow::Result<()> 
     );
     assert_eq!(
         tool_call.model_visible_call_item_ids,
-        first_inference.response_item_ids,
+        vec![first_inference.response_item_ids[1].clone()],
     );
     assert_eq!(
         tool_call.model_visible_output_item_ids,

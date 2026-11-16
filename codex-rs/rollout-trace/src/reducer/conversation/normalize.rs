@@ -273,13 +273,6 @@ fn normalize_reasoning_item(
         }
     }
 
-    if parts.is_empty() {
-        bail!(
-            "reasoning item in payload {} contained no content, summary, or encrypted_content",
-            raw_payload.raw_payload_id
-        );
-    }
-
     Ok(NormalizedConversationItem {
         role: ConversationRole::Assistant,
         channel: Some(ConversationChannel::Analysis),
